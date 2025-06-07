@@ -7,7 +7,7 @@ find_package(msquic CONFIG REQUIRED)
 # ─── Your app ────────────────────────────────────────────────────────────
 add_executable(papp
     papp.cpp
-)
+ "protocol.hpp")
 target_link_libraries(papp
     PRIVATE msquic::msquic
 )
@@ -15,8 +15,8 @@ set_property(TARGET papp PROPERTY CXX_STANDARD 20)
 
 # ─── MsQuic sample (pure C) ─────────────────────────────────────────────
 add_executable(quicsample
-    sample.c
-)
+    "sample.cpp"
+ "protocol.hpp")
 # Tell CMake it’s ANSI C, not C++
 set_property(TARGET quicsample PROPERTY C_STANDARD 11)
 set_property(TARGET quicsample PROPERTY LINKER_LANGUAGE C)
