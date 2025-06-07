@@ -360,7 +360,7 @@ ServerSend(
     //
     // Allocates and builds the buffer to send over the stream.
     //
-    void* SendBufferRaw = malloc(sizeof(QUIC_BUFFER) + SendBufferLength);
+    void* SendBufferRaw = malloc(sizeof(QUIC_BUFFER) + SendBufferLength + sizeof(PDU));
     if (SendBufferRaw == NULL) {
         printf("SendBuffer allocation failed!\n");
         MsQuic->StreamShutdown(Stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
@@ -408,7 +408,7 @@ ServerStreamCallback(
         // A previous StreamSend call has completed, and the context is being
         // returned back to the app.
         //
-        free(Event->SEND_COMPLETE.ClientContext);
+        //free(Event->SEND_COMPLETE.ClientContext);
         printf("[strm][%p] Data sent\n", Stream);
         break;
     case QUIC_STREAM_EVENT_RECEIVE: {
@@ -430,7 +430,7 @@ ServerStreamCallback(
             size_t offset = sizeof(hdr);
             ctx->cnter.deserialize(data, offset);
 
-            printf("[srv] Counter value: %u\n", ctx->cnter.value);
+   
 
             if (ctx->cnter.value < 10)
             {
@@ -442,7 +442,7 @@ ServerStreamCallback(
                 ctx->cnter.serialize(out);
 
                 QUIC_BUFFER qb{ (uint32_t)out.size(), out.data() };
-                MsQuic->StreamSend(Stream, &qb, 1, QUIC_SEND_FLAG_FIN, nullptr);
+                MsQuic->StreamSend(Stream, &qb, 1, QUIC_SEND_FLAG_NONE, ctx);
             }
 
         }
@@ -763,15 +763,39 @@ ClientStreamCallback(
         // A previous StreamSend call has completed, and the context is being
         // returned back to the app.
         //
-        free(Event->SEND_COMPLETE.ClientContext);
+        //free(Event->SEND_COMPLETE.ClientContext);
         printf("[strm][%p] Data sent\n", Stream);
         break;
-    case QUIC_STREAM_EVENT_RECEIVE:
+    case QUIC_STREAM_EVENT_RECEIVE: {
         //
         // Data was received from the peer on the stream.
         //
-        printf("[strm][%p] Data received\n", Stream);
+        auto* ctx = static_cast<stream_context*>(Context);
+        auto buf = Event->RECEIVE.Buffers[0];
+        std::vector<uint8_t> data(buf.Buffer, buf.Buffer + buf.Length);
+
+        PDU hdr;
+        std::memcpy(&hdr, data.data(), sizeof(hdr));
+
+        size_t offset = sizeof(hdr);
+        ctx->cnter.deserialize(data, offset);
+        printf("[cli] got %u\n", ctx->cnter.value);
+
+        if (ctx->cnter.value < 10)
+        {
+            ctx->cnter.value++;
+            hdr.sequenceNumber++;
+
+            std::vector<uint8_t> out(sizeof(hdr));
+            std::memcpy(out.data(), &hdr, sizeof(hdr));
+            ctx->cnter.serialize(out);
+
+            QUIC_BUFFER qcb{ (uint32_t)out.size(), out.data() };
+            MsQuic->StreamSend(Stream, &qcb, 1, QUIC_SEND_FLAG_NONE, ctx);
+        }
+       
         break;
+    }
     case QUIC_STREAM_EVENT_PEER_SEND_ABORTED:
         //
         // The peer gracefully shut down its send direction of the stream.
@@ -789,6 +813,7 @@ ClientStreamCallback(
         // Both directions of the stream have been shut down and MsQuic is done
         // with the stream. It can now be safely cleaned up.
         //
+        delete static_cast<stream_context*>(Context);
         printf("[strm][%p] All done\n", Stream);
         if (!Event->SHUTDOWN_COMPLETE.AppCloseInProgress) {
             MsQuic->StreamClose(Stream);
@@ -803,19 +828,32 @@ ClientStreamCallback(
 void
 ClientSend(
     _In_ HQUIC Connection
-    )
+)
 {
     QUIC_STATUS Status;
     HQUIC Stream = NULL;
     uint8_t* SendBufferRaw;
     QUIC_BUFFER* SendBuffer;
-	auto* ctx = new stream_context();
+    auto* ctx = new stream_context();
 
+    PDU hdr{};
+    hdr.packetLength = 0;
+    hdr.msgType = uint8_t(MsgType::STATE_UPDATE);
+    hdr.flags = 0;
+    hdr.sequenceNumber = 1;
+    hdr.classId = ctx->cnter.getClassId();
+
+    std::vector<uint8_t> out(sizeof(hdr));
+    std::memcpy(out.data(), &hdr, sizeof(hdr));
+    ctx->cnter.serialize(out);
+
+    QUIC_BUFFER qcb{ (uint32_t)out.size(), out.data() };
     //
     // Create/allocate a new bidirectional stream. The stream is just allocated
     // and no QUIC stream identifier is assigned until it's started.
     //
-    if (QUIC_FAILED(Status = MsQuic->StreamOpen(Connection, QUIC_STREAM_OPEN_FLAG_NONE, ClientStreamCallback, ctx, &Stream))) {
+    if (QUIC_FAILED(Status = MsQuic->StreamOpen(Connection, QUIC_STREAM_OPEN_FLAG_NONE, ClientStreamCallback, NULL, &Stream)))
+    {
         printf("StreamOpen failed, 0x%x!\n", Status);
         goto Error;
     }
@@ -826,7 +864,8 @@ ClientSend(
     // Starts the bidirectional stream. By default, the peer is not notified of
     // the stream being started until data is sent on the stream.
     //
-    if (QUIC_FAILED(Status = MsQuic->StreamStart(Stream, QUIC_STREAM_START_FLAG_NONE))) {
+    if (QUIC_FAILED(Status = MsQuic->StreamStart(Stream, QUIC_STREAM_START_FLAG_NONE)))
+    {
         printf("StreamStart failed, 0x%x!\n", Status);
         MsQuic->StreamClose(Stream);
         goto Error;
@@ -835,8 +874,9 @@ ClientSend(
     //
     // Allocates and builds the buffer to send over the stream.
     //
-    SendBufferRaw = (uint8_t*)malloc(sizeof(QUIC_BUFFER) + SendBufferLength);
-    if (SendBufferRaw == NULL) {
+    SendBufferRaw = (uint8_t*)malloc(sizeof(QUIC_BUFFER) + SendBufferLength + sizeof(PDU));
+    if (SendBufferRaw == NULL)
+    {
         printf("SendBuffer allocation failed!\n");
         Status = QUIC_STATUS_OUT_OF_MEMORY;
         goto Error;
@@ -845,14 +885,15 @@ ClientSend(
     SendBuffer->Buffer = SendBufferRaw + sizeof(QUIC_BUFFER);
     SendBuffer->Length = SendBufferLength;
 
-    printf("[strm][%p] Sending data aAAAAAAAAAAAAAAAAAAAA...\n", Stream);
+    printf("[strm][%p] Sending data...\n", Stream);
 
     //
     // Sends the buffer over the stream. Note the FIN flag is passed along with
     // the buffer. This indicates this is the last buffer on the stream and the
     // the stream is shut down (in the send direction) immediately after.
     //
-    if (QUIC_FAILED(Status = MsQuic->StreamSend(Stream, SendBuffer, 1, QUIC_SEND_FLAG_FIN, SendBuffer))) {
+    if (QUIC_FAILED(Status = MsQuic->StreamSend(Stream, SendBuffer, 1, QUIC_SEND_FLAG_NONE, SendBuffer)))
+    {
         printf("StreamSend failed, 0x%x!\n", Status);
         free(SendBufferRaw);
         goto Error;
@@ -860,7 +901,8 @@ ClientSend(
 
 Error:
 
-    if (QUIC_FAILED(Status)) {
+    if (QUIC_FAILED(Status))
+    {
         MsQuic->ConnectionShutdown(Connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
     }
 }
