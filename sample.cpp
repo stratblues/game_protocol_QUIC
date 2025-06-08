@@ -413,6 +413,7 @@ ServerStreamCallback(
         // returned back to the app.
         //
         //free(Event->SEND_COMPLETE.ClientContext);
+       
         delete[] reinterpret_cast<uint8_t*>(Event->SEND_COMPLETE.ClientContext);
         printf("[strm][%p] Data sent\n", Stream);
         break;
@@ -422,23 +423,24 @@ ServerStreamCallback(
         //
         const auto& in = Event->RECEIVE.Buffers[0];
 
-     
         PDU hdr{}; 
         memcpy(&hdr, in.Buffer, sizeof(hdr));
         if (hdr.msgType != uint8_t(MsgType::STATE_UPDATE))
             break;
 
     
-        memcpy(&ctx->cnter.value,
-            in.Buffer + sizeof(hdr),
-            sizeof(ctx->cnter.value));
+        memcpy(&ctx->cnter.value, in.Buffer + sizeof(hdr),sizeof(ctx->cnter.value));
         printf("[srv][%p] got %u\n", Stream, ctx->cnter.value);
 
-        if (ctx->cnter.value >= 10)
+        if (ctx->cnter.value > 10)
+        {
+            MsQuic->StreamShutdown(Stream, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL,0);
             break;
+        }
+           
 
        
-        ctx->cnter.value++;
+        //ctx->cnter.value++;
         hdr.sequenceNumber = ctx->cnter.value;
 
         const uint32_t payLen = sizeof(hdr) + sizeof(ctx->cnter.value);
@@ -767,6 +769,7 @@ ClientStreamCallback(
     _Inout_ QUIC_STREAM_EVENT* Event
     )
 {
+    auto* ctx = static_cast<stream_context*>(Context);
     UNREFERENCED_PARAMETER(Context);
     switch (Event->Type) {
     case QUIC_STREAM_EVENT_SEND_COMPLETE:
@@ -775,13 +778,14 @@ ClientStreamCallback(
         // returned back to the app.
         //
         //free(Event->SEND_COMPLETE.ClientContext);
+        delete[] reinterpret_cast<uint8_t*>(Event->SEND_COMPLETE.ClientContext);
         printf("[strm][%p] Data sent\n", Stream);
         break;
     case QUIC_STREAM_EVENT_RECEIVE: {
         //
         // Data was received from the peer on the stream.
         //
-        auto* ctx = static_cast<stream_context*>(Context);
+        //auto* ctx = static_cast<stream_context*>(Context);
         auto  buf = Event->RECEIVE.Buffers[0];
 
        
@@ -820,7 +824,7 @@ ClientStreamCallback(
         // Both directions of the stream have been shut down and MsQuic is done
         // with the stream. It can now be safely cleaned up.
         //
-        delete static_cast<stream_context*>(Context);
+        delete ctx;
         printf("[strm][%p] All done\n", Stream);
         if (!Event->SHUTDOWN_COMPLETE.AppCloseInProgress) {
             MsQuic->StreamClose(Stream);
@@ -848,21 +852,27 @@ SendNextMessage(HQUIC Stream, stream_context* ctx)
     hdr.sequenceNumber = ctx->cnter.value;
     hdr.classId = ctx->cnter.getClassId();
 
+	// allocate on heap 
     const uint32_t payLen = sizeof(hdr) + sizeof(ctx->cnter.value);
+	// allocate raw buffer for QUIC_BUFFER + payload
     uint8_t* raw = new uint8_t[sizeof(QUIC_BUFFER) + payLen];
+	// fill the QUIC_BUFFER structure out of the raw buffer
     auto* qb = reinterpret_cast<QUIC_BUFFER*>(raw);
+	// set the buffer pointer to the payload part of the raw buffer
     qb->Buffer = raw + sizeof(QUIC_BUFFER);
+	// set the length of the payload
     qb->Length = payLen;
 
+	// copy the header and the counter value into the buffer
     memcpy(qb->Buffer, &hdr, sizeof(hdr));
+	// copy the counter value into the buffer after the header
     memcpy(qb->Buffer + sizeof(hdr), &ctx->cnter.value, sizeof(ctx->cnter.value));
 
-    QUIC_SEND_FLAGS flags = (ctx->cnter.value == 10)
-        ? QUIC_SEND_FLAG_FIN
-        : QUIC_SEND_FLAG_NONE;
+    QUIC_SEND_FLAGS flags = (ctx->cnter.value == 10) ? QUIC_SEND_FLAG_FIN : QUIC_SEND_FLAG_NONE;
 
     if (QUIC_FAILED(MsQuic->StreamSend(Stream, qb, 1, flags, qb)))
     {
+        // cleanup 
         delete[] raw;                        
         return;
     }
@@ -878,12 +888,7 @@ ClientSend(
     QUIC_STATUS Status;
     HQUIC Stream = nullptr;
     auto* ctx = new stream_context();
-    if (QUIC_FAILED(Status = MsQuic->StreamOpen(
-        Connection,
-        QUIC_STREAM_OPEN_FLAG_NONE,
-        ClientStreamCallback,
-        ctx,
-        &Stream)))
+    if (QUIC_FAILED(Status = MsQuic->StreamOpen(Connection, QUIC_STREAM_OPEN_FLAG_NONE, ClientStreamCallback,ctx,&Stream)))
     {
         printf("StreamOpen failed, 0x%x!\n", Status);
         delete ctx;
