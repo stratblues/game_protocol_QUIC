@@ -1,4 +1,4 @@
-/*++
+﻿/*++
 
     Copyright (c) Microsoft Corporation.
     Licensed under the MIT License.
@@ -68,10 +68,12 @@ struct counter : GameObject
 	// const since data is immutable
     void serialize(std::vector<uint8_t>& buf) const 
     {
+        //build the packet into bytes
         auto start = buf.size();
         buf.resize(start + sizeof(value));
         std::memcpy(buf.data() + start, &value, sizeof(value));
     }
+    // read in const ref to buf + offset 
     void deserialize(const std::vector<uint8_t>& buf, size_t& offset) 
     {
         std::memcpy(&value, buf.data() + offset, sizeof(value));
@@ -84,6 +86,8 @@ struct stream_context
     counter        cnter;
     uint32_t       seq = 1;
 };
+
+void SendNextMessage(HQUIC Stream, stream_context* ctx);
 
 //
 // The (optional) registration configuration for the app. This sets a name for
@@ -368,7 +372,7 @@ ServerSend(
     }
     QUIC_BUFFER* SendBuffer = (QUIC_BUFFER*)SendBufferRaw;
     SendBuffer->Buffer = (uint8_t*)SendBufferRaw + sizeof(QUIC_BUFFER);
-    SendBuffer->Length = SendBufferLength;
+    SendBuffer->Length = SendBufferLength + sizeof(PDU);
 
     printf("[strm][%p] Sending data...\n", Stream);
 
@@ -409,42 +413,47 @@ ServerStreamCallback(
         // returned back to the app.
         //
         //free(Event->SEND_COMPLETE.ClientContext);
+        delete[] reinterpret_cast<uint8_t*>(Event->SEND_COMPLETE.ClientContext);
         printf("[strm][%p] Data sent\n", Stream);
         break;
     case QUIC_STREAM_EVENT_RECEIVE: {
         //
         // Data was received from the peer on the stream.
         //
+        const auto& in = Event->RECEIVE.Buffers[0];
 
+     
+        PDU hdr{}; 
+        memcpy(&hdr, in.Buffer, sizeof(hdr));
+        if (hdr.msgType != uint8_t(MsgType::STATE_UPDATE))
+            break;
 
-        auto B = Event->RECEIVE.Buffers[0];
-        std::vector<uint8_t> data(B.Buffer, B.Buffer + B.Length);
+    
+        memcpy(&ctx->cnter.value,
+            in.Buffer + sizeof(hdr),
+            sizeof(ctx->cnter.value));
+        printf("[srv][%p] got %u\n", Stream, ctx->cnter.value);
 
+        if (ctx->cnter.value >= 10)
+            break;
 
-        PDU hdr;
-        std::memcpy(&hdr, data.data(), sizeof(hdr));
+       
+        ctx->cnter.value++;
+        hdr.sequenceNumber = ctx->cnter.value;
 
+        const uint32_t payLen = sizeof(hdr) + sizeof(ctx->cnter.value);
+        uint8_t* raw = new uint8_t[sizeof(QUIC_BUFFER) + payLen];
+        auto* qb = reinterpret_cast<QUIC_BUFFER*>(raw);
+        qb->Buffer = raw + sizeof(QUIC_BUFFER);
+        qb->Length = payLen;
 
-        if (hdr.msgType == uint8_t(MsgType::STATE_UPDATE))
+        memcpy(qb->Buffer, &hdr, sizeof(hdr));
+        memcpy(qb->Buffer + sizeof(hdr), &ctx->cnter.value, sizeof(ctx->cnter.value));
+
+        if (QUIC_FAILED(MsQuic->StreamSend(Stream, qb, 1,
+            QUIC_SEND_FLAG_NONE, qb)))
         {
-            size_t offset = sizeof(hdr);
-            ctx->cnter.deserialize(data, offset);
-
-   
-
-            if (ctx->cnter.value < 10)
-            {
-
-                ctx->cnter.value++;
-                hdr.sequenceNumber++;
-                std::vector<uint8_t> out(sizeof(hdr));
-                std::memcpy(out.data(), &hdr, sizeof(hdr));
-                ctx->cnter.serialize(out);
-
-                QUIC_BUFFER qb{ (uint32_t)out.size(), out.data() };
-                MsQuic->StreamSend(Stream, &qb, 1, QUIC_SEND_FLAG_NONE, ctx);
-            }
-
+            delete[] raw;                     
         }
         break;
     }
@@ -453,7 +462,9 @@ ServerStreamCallback(
         // The peer gracefully shut down its send direction of the stream.
         //
         printf("[strm][%p] Peer shut down\n", Stream);
-        ServerSend(Stream);
+        MsQuic->StreamShutdown(Stream,
+            QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL,
+            0);
         break;
     case QUIC_STREAM_EVENT_PEER_SEND_ABORTED:
         //
@@ -771,30 +782,26 @@ ClientStreamCallback(
         // Data was received from the peer on the stream.
         //
         auto* ctx = static_cast<stream_context*>(Context);
-        auto buf = Event->RECEIVE.Buffers[0];
-        std::vector<uint8_t> data(buf.Buffer, buf.Buffer + buf.Length);
+        auto  buf = Event->RECEIVE.Buffers[0];
 
+       
         PDU hdr;
-        std::memcpy(&hdr, data.data(), sizeof(hdr));
-
-        size_t offset = sizeof(hdr);
-        ctx->cnter.deserialize(data, offset);
+        std::memcpy(&hdr, buf.Buffer, sizeof(hdr));
+        size_t off = sizeof(hdr);
+        std::vector<uint8_t> data(buf.Buffer, buf.Buffer + buf.Length);
+        ctx->cnter.deserialize(data, off);
         printf("[cli] got %u\n", ctx->cnter.value);
 
         if (ctx->cnter.value < 10)
         {
-            ctx->cnter.value++;
-            hdr.sequenceNumber++;
-
-            std::vector<uint8_t> out(sizeof(hdr));
-            std::memcpy(out.data(), &hdr, sizeof(hdr));
-            ctx->cnter.serialize(out);
-
-            QUIC_BUFFER qcb{ (uint32_t)out.size(), out.data() };
-            MsQuic->StreamSend(Stream, &qcb, 1, QUIC_SEND_FLAG_NONE, ctx);
+            SendNextMessage(Stream, ctx);
         }
-       
+        else
+        {
+            MsQuic->StreamShutdown(Stream, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0);
+        }
         break;
+        
     }
     case QUIC_STREAM_EVENT_PEER_SEND_ABORTED:
         //
@@ -824,6 +831,44 @@ ClientStreamCallback(
     }
     return QUIC_STATUS_SUCCESS;
 }
+void
+SendNextMessage(HQUIC Stream, stream_context* ctx)
+{
+	
+    if (ctx->cnter.value > 10)
+    {
+        MsQuic->StreamShutdown(Stream, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0);
+        return;
+    }
+    ctx->cnter.value++;
+    PDU hdr{};
+    hdr.packetLength = sizeof(hdr) + sizeof(ctx->cnter.value);
+    hdr.msgType = uint8_t(MsgType::STATE_UPDATE);
+    hdr.flags = 0;
+    hdr.sequenceNumber = ctx->cnter.value;
+    hdr.classId = ctx->cnter.getClassId();
+
+    const uint32_t payLen = sizeof(hdr) + sizeof(ctx->cnter.value);
+    uint8_t* raw = new uint8_t[sizeof(QUIC_BUFFER) + payLen];
+    auto* qb = reinterpret_cast<QUIC_BUFFER*>(raw);
+    qb->Buffer = raw + sizeof(QUIC_BUFFER);
+    qb->Length = payLen;
+
+    memcpy(qb->Buffer, &hdr, sizeof(hdr));
+    memcpy(qb->Buffer + sizeof(hdr), &ctx->cnter.value, sizeof(ctx->cnter.value));
+
+    QUIC_SEND_FLAGS flags = (ctx->cnter.value == 10)
+        ? QUIC_SEND_FLAG_FIN
+        : QUIC_SEND_FLAG_NONE;
+
+    if (QUIC_FAILED(MsQuic->StreamSend(Stream, qb, 1, flags, qb)))
+    {
+        delete[] raw;                        
+        return;
+    }
+
+    printf("[cli][%p] Sent %u\n", Stream, ctx->cnter.value);
+};
 
 void
 ClientSend(
@@ -831,81 +876,38 @@ ClientSend(
 )
 {
     QUIC_STATUS Status;
-    HQUIC Stream = NULL;
-    uint8_t* SendBufferRaw;
-    QUIC_BUFFER* SendBuffer;
+    HQUIC Stream = nullptr;
     auto* ctx = new stream_context();
-
-    PDU hdr{};
-    hdr.packetLength = 0;
-    hdr.msgType = uint8_t(MsgType::STATE_UPDATE);
-    hdr.flags = 0;
-    hdr.sequenceNumber = 1;
-    hdr.classId = ctx->cnter.getClassId();
-
-    std::vector<uint8_t> out(sizeof(hdr));
-    std::memcpy(out.data(), &hdr, sizeof(hdr));
-    ctx->cnter.serialize(out);
-
-    QUIC_BUFFER qcb{ (uint32_t)out.size(), out.data() };
-    //
-    // Create/allocate a new bidirectional stream. The stream is just allocated
-    // and no QUIC stream identifier is assigned until it's started.
-    //
-    if (QUIC_FAILED(Status = MsQuic->StreamOpen(Connection, QUIC_STREAM_OPEN_FLAG_NONE, ClientStreamCallback, NULL, &Stream)))
+    if (QUIC_FAILED(Status = MsQuic->StreamOpen(
+        Connection,
+        QUIC_STREAM_OPEN_FLAG_NONE,
+        ClientStreamCallback,
+        ctx,
+        &Stream)))
     {
         printf("StreamOpen failed, 0x%x!\n", Status);
-        goto Error;
+        delete ctx;
+        return;
     }
 
-    printf("[strm][%p] Starting...\n", Stream);
-
-    //
-    // Starts the bidirectional stream. By default, the peer is not notified of
-    // the stream being started until data is sent on the stream.
-    //
+    
+    printf("[cli][%p] Starting stream...\n", Stream);
     if (QUIC_FAILED(Status = MsQuic->StreamStart(Stream, QUIC_STREAM_START_FLAG_NONE)))
     {
         printf("StreamStart failed, 0x%x!\n", Status);
         MsQuic->StreamClose(Stream);
-        goto Error;
+        delete ctx;
+        return;
     }
 
-    //
-    // Allocates and builds the buffer to send over the stream.
-    //
-    SendBufferRaw = (uint8_t*)malloc(sizeof(QUIC_BUFFER) + SendBufferLength + sizeof(PDU));
-    if (SendBufferRaw == NULL)
-    {
-        printf("SendBuffer allocation failed!\n");
-        Status = QUIC_STATUS_OUT_OF_MEMORY;
-        goto Error;
-    }
-    SendBuffer = (QUIC_BUFFER*)SendBufferRaw;
-    SendBuffer->Buffer = SendBufferRaw + sizeof(QUIC_BUFFER);
-    SendBuffer->Length = SendBufferLength;
+    
+    SendNextMessage(Stream, ctx);
 
-    printf("[strm][%p] Sending data...\n", Stream);
-
-    //
-    // Sends the buffer over the stream. Note the FIN flag is passed along with
-    // the buffer. This indicates this is the last buffer on the stream and the
-    // the stream is shut down (in the send direction) immediately after.
-    //
-    if (QUIC_FAILED(Status = MsQuic->StreamSend(Stream, SendBuffer, 1, QUIC_SEND_FLAG_NONE, SendBuffer)))
-    {
-        printf("StreamSend failed, 0x%x!\n", Status);
-        free(SendBufferRaw);
-        goto Error;
-    }
-
-Error:
-
-    if (QUIC_FAILED(Status))
-    {
-        MsQuic->ConnectionShutdown(Connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
-    }
+ 
 }
+
+
+
 
 //
 // The clients's callback for connection events from MsQuic.
@@ -1115,6 +1117,8 @@ Error:
 }
 
 
+
+
 //
 // Runs the multi client side of the protocol.
 //
@@ -1264,3 +1268,5 @@ Error:
 
     return (int)Status;
 }
+
+
