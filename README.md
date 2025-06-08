@@ -109,17 +109,7 @@ In a second terminal, run:
 * **`-unsecure`**: skip certificate validation (for testing)
 * **`-target`**: server address (IPv4 or hostname)
 
-**Expected output**:
 
-```text
-[conn][0x...] Connected
-[cli][0x...] Starting stream...
-[cli][0x...] Sent 1
-[strm][0x...] Data sent
-[conn][0x...] Resumption ticket received (... bytes)
-[strm][0x...] All done
-[conn][0x...] All done
-```
 
 ---
 
