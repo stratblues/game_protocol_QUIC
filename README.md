@@ -1,6 +1,6 @@
 # myprotocol
 
-A simple client-server sample using the Microsoft MsQuic API. It implements a basic request-response protocol (ALPN: `sample`) over QUIC: the client sends state‐update messages (1…10), the server echoes them back, then cleanly closes the stream.
+A simple client-server sample using the Microsoft MsQuic API. 
 
 ---
 
